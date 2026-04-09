@@ -1,0 +1,31 @@
+{
+  "benchmark": ["SPY"],
+  "sector": [
+    "SPY",
+    "QQQ",
+    "GLD",
+    "USO",
+    "TLT",
+    "LQD",
+    "HYG",
+    "UUP",
+    "IBIT",
+    "SOXX",
+    "XLF",
+    "XLE",
+    "VXX"
+  ],
+  "static": [
+    "AACI"
+  ],
+  "approved_dynamic": [],
+  "candidates": [
+    "NVDA",
+    "AMD",
+    "INTC",
+    "AAPL",
+    "TSLA",
+    "CRM",
+    "ADBE"
+  ]
+}
