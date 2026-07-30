@@ -27,6 +27,7 @@ dependencies = [
     "numpy>=1.23.0",
     "httpx>=0.23.0",
     "QuantLib>=1.28.0",
+    "requests>=2.28.0",
 ]
 
 [project.urls]
@@ -34,7 +35,7 @@ Homepage = "https://github.com/yourusername/src-core"
 Repository = "https://github.com/yourusername/src-core.git"
 
 [tool.setuptools]
-packages = ["src", "src.util", "src.market"]
+packages = ["src", "src.util", "src.market", "src.common", "src.schwab", "src.options"]
 
 [tool.setuptools.package-data]
 src = ["*"]

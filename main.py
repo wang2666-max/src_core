@@ -135,7 +135,7 @@ try:
     
     # Show a few key columns
     print("✓ Sample adjusted data:")
-    print(df_adjusted[["date", "close", "adj_close_total_return", "adj_factor_total_return"]])
+    print(df_adjusted[["date", "close", "adj_close", "adj_factor_total_return"]])
     
 except Exception as e:
     print(f"✗ Error in total return adjustment: {e}")
