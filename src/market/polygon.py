@@ -155,11 +155,20 @@ class PolygonClient:
 
     @staticmethod
     def apply_total_return_adjustment(
-        price_df: pd.DataFrame, dividend_df: Optional[pd.DataFrame] = None
+        price_df: pd.DataFrame,
+        dividend_df: Optional[pd.DataFrame] = None,
+        prior_close: Optional[float] = None,
+        prior_adj_close: Optional[float] = None,
     ) -> pd.DataFrame:
         """
         Enrich price_df with dividend and total-return-adjusted OHLC columns.
         All numeric values rounded to 4 decimals (0.0001 precision).
+
+        By default the adjustment chain is anchored at price_df's own first
+        row (adj_factor = 1.0 there). Pass prior_close/prior_adj_close to
+        continue an existing chain instead — e.g. when appending new rows to
+        an already-adjusted history, so the whole history doesn't need to be
+        recomputed just to add a few new rows at the end.
         """
         df = price_df.copy()
 
@@ -214,12 +223,28 @@ class PolygonClient:
             if pd.notna(df.loc[0, "close"])
             else float("nan")
         )
-        adj_close_vals.append(first_close)
-        adj_factor_vals.append(
-            1.0
-            if pd.notna(first_close) and first_close != 0
-            else float("nan")
-        )
+
+        if prior_close is not None and prior_adj_close is not None:
+            # Continue an existing chain rather than restarting at 1.0 here.
+            first_div = float(df.loc[0, "dividend"])
+            if prior_close > 0 and pd.notna(first_close):
+                gross_ret = (first_close + first_div) / prior_close
+                first_adj_close = prior_adj_close * gross_ret
+            else:
+                first_adj_close = first_close
+            adj_close_vals.append(first_adj_close)
+            adj_factor_vals.append(
+                first_adj_close / first_close
+                if pd.notna(first_close) and first_close != 0
+                else float("nan")
+            )
+        else:
+            adj_close_vals.append(first_close)
+            adj_factor_vals.append(
+                1.0
+                if pd.notna(first_close) and first_close != 0
+                else float("nan")
+            )
 
         for i in range(1, len(df)):
             prev_close = df.loc[i - 1, "close"]
@@ -272,125 +297,96 @@ class PolygonClient:
         j = self._get(path, {"adjusted": "true", "sort": "asc", "limit": 50000})
         return self._rows_to_df(j.get("results") or [], ticker)
 
-    def fetch_initial(
-        self,
-        ticker: str,
-        start: Optional[str] = None,
-        market_date: Optional[date] = None,
-    ) -> pd.DataFrame:
+    def fetch_range(self, ticker: str, start: str, end: str) -> pd.DataFrame:
         """
-        Initial backfill for 'ticker' from start (or DEFAULT_INIT_START)
-        through market_date. Fetches OHLC, enriches with dividends,
-        writes CSV and returns the DataFrame saved.
+        Ensure the cached CSV for `ticker` covers [start, end], fetching only
+        what's missing, and return the full cached history.
+
+        - CSV missing -> fetch [start, end] fresh, write.
+        - `start` already covered by the cache -> fetch forward only
+          [latest+1, end], continuing the adjustment chain from the last
+          cached row. Cheap: no re-fetch of historical dividends, no
+          recompute of already-adjusted rows. This is the routine path
+          (e.g. a daily update).
+        - `start` earlier than what's cached -> the adjustment anchor has to
+          move to the new earliest row, which invalidates every existing
+          adj_close, so this refetches and recomputes
+          [min(start, earliest), max(end, latest)] in full. Expected to be
+          rare (a one-time "need more history" ask) rather than routine.
         """
-        start = start or DEFAULT_INIT_START
-        end = (market_date or date.today()).isoformat()
+        p = self._csv_path(ticker)
 
-        path = f"/v2/aggs/ticker/{ticker}/range/1/day/{start}/{end}"
-        j = self._get(path, {"adjusted": "true", "sort": "asc", "limit": 50000})
-        df = self._rows_to_df(j.get("results") or [], ticker)
-
-        # Enrich with dividends and adjusted columns
-        if not df.empty:
-            div_df = self.fetch_range_dividends(ticker, start, end)
-            df = self.apply_total_return_adjustment(df, div_df)
-
-        self._write_csv_init(ticker, df)
-
-        if df.empty:
-            print(f"[warn] {ticker}: init returned 0 rows ({start}..{end})")
-        else:
+        if not p.exists():
+            df = self._fetch_and_adjust(ticker, start, end)
+            self._write_csv(ticker, df)
             print(f"[init-ok] {ticker}: wrote {len(df)} rows [{start}..{end}]")
-        return df
+            return df
 
-    def _write_csv_init(self, ticker: str, df: pd.DataFrame):
-        """Write initial CSV with dividend and adjusted columns."""
+        existing = pd.read_csv(p, dtype={"ticker": str})
+        if existing.empty:
+            df = self._fetch_and_adjust(ticker, start, end)
+            self._write_csv(ticker, df)
+            return df
+
+        existing["date"] = pd.to_datetime(existing["date"], errors="coerce").dt.date.astype(str)
+        existing = existing.dropna(subset=["date"]).sort_values("date").reset_index(drop=True)
+        earliest, latest = existing["date"].iloc[0], existing["date"].iloc[-1]
+
+        if start < earliest:
+            full_start, full_end = min(start, earliest), max(end, latest)
+            df = self._fetch_and_adjust(ticker, full_start, full_end)
+            self._write_csv(ticker, df)
+            print(f"[backfill-ok] {ticker}: rewrote {len(df)} rows [{full_start}..{full_end}]")
+            return df
+
+        if end <= latest:
+            return existing  # already fully covered, nothing to fetch
+
+        new_start = (date.fromisoformat(latest) + timedelta(days=1)).isoformat()
+        last_row = existing.iloc[-1]
+        new_rows = self._fetch_and_adjust(
+            ticker, new_start, end,
+            prior_close=float(last_row["close"]), prior_adj_close=float(last_row["adj_close"]),
+        )
+        if new_rows.empty:
+            print(f"[noop] {ticker}: up to date (latest={latest})")
+            return existing
+
+        merged = pd.concat([existing, new_rows], ignore_index=True)
+        self._write_csv(ticker, merged)
+        print(f"[ok] {ticker}: appended {len(new_rows)} rows [{new_start}..{end}]")
+        return merged
+
+    def _fetch_and_adjust(
+        self, ticker: str, start: str, end: str,
+        prior_close: Optional[float] = None, prior_adj_close: Optional[float] = None,
+    ) -> pd.DataFrame:
+        """Raw OHLC fetch + dividend fetch + total-return adjustment for [start, end]."""
+        raw = self.fetch_range_ohlc(ticker, start, end)
+        if raw.empty:
+            return raw
+        div_df = self.fetch_range_dividends(ticker, start, end)
+        return self.apply_total_return_adjustment(
+            raw, div_df, prior_close=prior_close, prior_adj_close=prior_adj_close,
+        )
+
+    def _write_csv(self, ticker: str, df: pd.DataFrame) -> None:
         p = self._csv_path(ticker)
         if not df.empty:
             df = df.sort_values("date")
         df.to_csv(p, index=False)
 
-    def _latest_csv_date(self, ticker: str) -> Optional[date]:
-        """Get the latest date from ticker's CSV file."""
-        p = self._csv_path(ticker)
-        if not p.exists():
-            return None
-        df = pd.read_csv(p, usecols=["date"])
-        if df.empty:
-            return None
-        d = pd.to_datetime(df["date"], errors="coerce").dropna()
-        if d.empty:
-            return None
-        return d.max().date()
-
-    def _merge_csv_update(self, ticker: str, df_new: pd.DataFrame):
-        """Merge new OHLC rows into existing CSV
-        and recompute all adjusted columns."""
-        p = self._csv_path(ticker)
-
-        if not p.exists():
-            self._write_csv_init(ticker, df_new)
-            return
-
-        if df_new is None or df_new.empty:
-            return
-
-        # Read existing CSV
-        df_old = pd.read_csv(p, dtype={"ticker": str})
-
-        # Normalize dates
-        if "date" in df_old.columns:
-            df_old["date"] = pd.to_datetime(df_old["date"]).dt.date.astype(str)
-        if "date" in df_new.columns:
-            df_new["date"] = pd.to_datetime(df_new["date"]).dt.date.astype(str)
-
-        # Merge histories
-        df = pd.concat([df_old, df_new], ignore_index=True)
-        df = (
-            df.drop_duplicates(subset=["date"])
-            .sort_values("date")
-            .reset_index(drop=True)
-        )
-
-        # Recalculate adjusted columns for entire history to ensure consistency
-        ohlc_cols = ["ticker", "date", "open", "high", "low", "close"]
-        df_ohlc = (
-            df[ohlc_cols].copy()
-            if all(c in df.columns for c in ohlc_cols)
-            else df
-        )
-
-        # Infer date range and fetch all dividends
-        if "date" in df.columns:
-            dates = pd.to_datetime(df["date"], errors="coerce")
-            min_date = dates.min()
-            max_date = dates.max()
-            if pd.notna(min_date) and pd.notna(max_date):
-                div_df = self.fetch_range_dividends(
-                    ticker,
-                    min_date.strftime("%Y-%m-%d"),
-                    max_date.strftime("%Y-%m-%d"),
-                )
-                df_ohlc = self.apply_total_return_adjustment(df_ohlc, div_df)
-            else:
-                df_ohlc = self.apply_total_return_adjustment(df_ohlc, None)
-        else:
-            df_ohlc = self.apply_total_return_adjustment(df_ohlc, None)
-
-        df_ohlc.to_csv(p, index=False)
-
-    def fetch_recent_ohlc(
+    def fetch_range_many(
         self,
         tickers: list[str],
+        start: Optional[str] = None,
         market_date: Optional[date] = None,
     ) -> dict:
         """
-        Incremental update (PER-TICKER):
-        - For each ticker:
-            - If CSV missing -> initial backfill to market_date
-            - Else -> fetch [latest+1 .. market_date] and merge
-        Returns: dict {TICKER: {"mode": "init"|"update"|"noop"|"err",
-                                 "rows": int, "range": "start..end"}}
+        fetch_range for multiple tickers in one call (e.g. a daily update
+        loop). `start` only matters for tickers with no CSV yet or that need
+        backfilling — existing, fully-covered tickers just extend forward.
+        Returns: dict {TICKER: {"rows": int, "range": "start..end"} | {"error": str}}
         """
         if not tickers:
             return {}
@@ -400,69 +396,20 @@ class PolygonClient:
 
         end_dt = market_date or date.today()
         end_date = end_dt.isoformat()
+        range_start = start or DEFAULT_INIT_START
 
         for t in tickers:
             try:
-                p = self._csv_path(t)
-
-                # init if missing
-                if not p.exists():
-                    df_init = self.fetch_initial(
-                        t, start=DEFAULT_INIT_START, market_date=end_dt
-                    )
-                    results[t] = {
-                        "mode": "init",
-                        "rows": int(len(df_init)),
-                        "range": f"{DEFAULT_INIT_START}..{end_date}",
-                    }
-                    continue
-
-                latest = self._latest_csv_date(t)
-                if latest is None:
-                    df_init = self.fetch_initial(
-                        t, start=DEFAULT_INIT_START, market_date=end_dt
-                    )
-                    results[t] = {
-                        "mode": "init",
-                        "rows": int(len(df_init)),
-                        "range": f"{DEFAULT_INIT_START}..{end_date}",
-                    }
-                    continue
-
-                start_date = (latest + timedelta(days=1)).isoformat()
-
-                if start_date > end_date:
-                    print(f"[noop] {t}: up to date (latest={latest})")
-                    results[t] = {"mode": "noop", "rows": 0, "range": ""}
-                    continue
-
-                df_new = self.fetch_range_ohlc(t, start_date, end_date)
-                self._merge_csv_update(t, df_new)
-                n = int(len(df_new))
-
-                print(f"[ok] {t}: appended {n} rows [{start_date}..{end_date}]")
-                results[t] = {
-                    "mode": "update",
-                    "rows": n,
-                    "range": f"{start_date}..{end_date}",
-                }
+                before = len(pd.read_csv(self._csv_path(t))) if self._csv_path(t).exists() else 0
+                df = self.fetch_range(t, range_start, end_date)
+                results[t] = {"rows": len(df) - before, "range": f"{range_start}..{end_date}"}
 
             except httpx.HTTPStatusError as e:
                 print(f"[HTTP {e.response.status_code}] {t}: {e}")
-                results[t] = {
-                    "mode": "err",
-                    "rows": 0,
-                    "range": "",
-                    "error": f"HTTP {e.response.status_code}",
-                }
+                results[t] = {"rows": 0, "range": "", "error": f"HTTP {e.response.status_code}"}
             except Exception as e:
                 print(f"[err] {t}: {e}")
-                results[t] = {
-                    "mode": "err",
-                    "rows": 0,
-                    "range": "",
-                    "error": str(e),
-                }
+                results[t] = {"rows": 0, "range": "", "error": str(e)}
 
         return results
 
@@ -479,15 +426,15 @@ def _default_prices_dir() -> Path:
     return Path("data") / "prices"
 
 
-def fetch_initial(
+def fetch_range(
     ticker: str,
+    start: str,
+    end: str,
     data_dir: Optional[Path] = None,
-    start: Optional[str] = None,
-    market_date: Optional[date] = None,
 ) -> pd.DataFrame:
-    """Initialize fetch for a single ticker."""
+    """Ensure the cached CSV for `ticker` covers [start, end]; fetch only what's missing."""
     client = PolygonClient(data_dir or _default_prices_dir())
-    return client.fetch_initial(ticker, start, market_date)
+    return client.fetch_range(ticker, start, end)
 
 
 def fetch_range_ohlc(
@@ -496,24 +443,29 @@ def fetch_range_ohlc(
     end: str,
     data_dir: Optional[Path] = None,
 ) -> pd.DataFrame:
-    """Fetch OHLC for a specific date range."""
+    """Raw OHLC fetch for a specific date range. No CSV, no adjustment."""
     client = PolygonClient(data_dir or _default_prices_dir())
     return client.fetch_range_ohlc(ticker, start, end)
 
 
-def fetch_recent_ohlc(
+def fetch_range_many(
     tickers: list[str],
     data_dir: Optional[Path] = None,
+    start: Optional[str] = None,
     market_date: Optional[date] = None,
 ) -> dict:
-    """Incremental fetch for multiple tickers."""
+    """fetch_range for multiple tickers in one call (e.g. a daily update loop)."""
     client = PolygonClient(data_dir or _default_prices_dir())
-    return client.fetch_recent_ohlc(tickers, market_date)
+    return client.fetch_range_many(tickers, start, market_date)
 
 
 def apply_total_return_adjustment(
     price_df: pd.DataFrame,
     dividend_df: Optional[pd.DataFrame] = None,
+    prior_close: Optional[float] = None,
+    prior_adj_close: Optional[float] = None,
 ) -> pd.DataFrame:
     """Apply total return adjustment to price DataFrame."""
-    return PolygonClient.apply_total_return_adjustment(price_df, dividend_df)
+    return PolygonClient.apply_total_return_adjustment(
+        price_df, dividend_df, prior_close=prior_close, prior_adj_close=prior_adj_close,
+    )
